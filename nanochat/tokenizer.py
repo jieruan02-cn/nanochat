@@ -55,4 +55,107 @@ class HuggingFaceTokenizer:
                 fuse_unk=False,
             )
         )
+        tokenizer.normalizer = None
+        # Pre-tokenizer: GPT-4 style
+        # the regrex pattern used by GPT-4 to split text into groups before BPE
+        # NOTE: The pattern was changed from \p{N}{1,3} to \p{N}{1,2} because I suspect it is harmful to
+        # very small models and smaller vocab sizes, because it is a little bit wasteful in the token space.
+        # (but I haven't validated this! TODO)
+        gpt4_split_regex = Regex(SPLIT_PATTERN)
+        tokenizer.pre_tokenizer = pre_tokenizers.Sequence(
+            [
+                pre_tokenizers.Split(
+                    pattern=gpt4_split_regex, behavior="isolated", invert=False
+                ),
+                pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False),
+            ]
+        )
+        # Decoder: ByteLevel (it pairs together with the ByteLevel pre-tokenizer)
+        tokenizer.decoder = decoders.ByteLevel()
+        tokenizer.post_processor = None
+        trainer = BpeTrainer(
+            vocab_size=vocab_size,
+            show_progress=True,
+            min_frequency=0,
+            initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
+            special_tokens=SPECIAL_TOKENS,
+        )
+        # Kick off the training
+        tokenizer.train_from_iterator(text_iterator, trainer)
+        return cls(tokenizer)
+
+    def get_vocab_size(self):
+        return self.tokenizer.get_vocab_size()
+
+    def get_special_tokens(self):
+        special_tokens_map = self.tokenizer.get_added_tokens_decoder()
+        special_tokens = [w.content for w in special_tokens_map.values()]
+        return special_tokens
+
+    def id_to_token(self, id):
+        return self.tokenizer.id_to_token(id)
+    
+    def encode_special(self, text):
+        # encode a single special token via exact match
+        return self.tokenizer.token_to_id(text)
+
+    def _encode_one(self, text, prepend=None, append=None):
+        assert isinstance(text, str)
+        ids = []
+        if prepend is not None:
+            prepend_id = prepend if isinstance(prepend, int) else self.encode_special(prepend)
+            ids.append(prepend_id)
+        ids.extend(self.tokenizer.encode(text, add_special_tokens=False).ids)
+        if append is not None:
+            append_id = append if isinstance(append, int) else self.encode_special(append)
+            ids.append(append_id)
+        return ids
+    
+    def get_bos_token_id(self):
+        bos = self.encode_special("<|bos|>")
+        return bos
+    
+    def encode(self, text, *args, **kwargs):
+        if isinstance(text, str):
+            return self._encode_one(text, *args, **kwargs)
+        elif isinstance(text, list):
+            return [self._encode_one(t, *args, **kwargs) for t in text]
+        else:
+            raise ValueError(f"Invalid input type: {type(text)}")
         
+    def __call__(self, *args, **kwargs):
+        return self.encode(*args, **kwargs)
+    
+    def decode(self, ids):
+        return self.tokenizer.decode(ids, skip_special_tokens=False)
+    
+    def save(self, tokenizer_dir):
+        os.makedirs(tokenizer_dir, exist_ok=True)
+        tokenizer_path = os.path.join(tokenizer_dir, "tokenizer.json")
+        self.tokenizer.save(tokenizer_path)
+        print(f"Save tokenizer to {tokenizer_path}")
+
+# -----------------------------------------------------------------------------
+# Tokenizer based on rustbpe + tiktoken combo
+import pickle
+import rustbpe
+import tiktoken
+
+class RustBPETokenizer:
+    """Light wrapper around tiktoken (for efficient inference) but train with rustbpe"""
+
+    def __init__(self, enc, bos_token):
+        self.enc = enc
+        self.bos_token_id = self.encode_special(bos_token)
+
+    @classmethod
+    def train_from_iterator(cls, text_iterator, vocab_size):
+        pass
+    
+    @classmethod
+    def from_directory(cls, tokenizer_dir):
+        pass
+    
+    @classmethod
+    def from_pretrained(cls, tiktoken_name):
+        pass
