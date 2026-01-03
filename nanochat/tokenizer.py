@@ -1,8 +1,8 @@
 """
-BPE Tokenizer in the style of GPT-4
+BPE Tokenizer in the style of GPT-4.
 
 Two implementations are available:
-1) HuggingFace Tokenizer that can do both trainning and inference but is really confusing
+1) HuggingFace Tokenizer that can do both training and inference but is really confusing
 2) Our own RustBPE Tokenizer for training and tiktoken for efficient inference
 """
 
@@ -10,14 +10,26 @@ import os
 import copy
 from functools import lru_cache
 
-SPECIAL_TOKENS = []
+SPECIAL_TOKENS = [
+    # every document begins with the Beginning of Sequence (BOS) token that delimits documents
+    "<|bos|>",
+    # tokens below are only used during finetuning to render Conversations into token ids
+    "<|user_start|>",  # user messages
+    "<|user_end|>",
+    "<|assistant_start|>",  # assistant messages
+    "<|assistant_end|>",
+    "<|python_start|>",  # assistant invokes python REPL tool
+    "<|python_end|>",
+    "<|output_start|>",  # python REPL outputs back to assistant
+    "<|output_end|>",
+]
 
-# NOTE: this split pattern deviates from GPT-4 in that we use \p{1,2} instead of \p{N}{1,3}
+# NOTE: this split pattern deviates from GPT-4 in that we use \p{N}{1,2} instead of \p{N}{1,3}
 # I did this because I didn't want to "waste" too many tokens on numbers for smaller vocab sizes.
 # I haven't validated that this is actually a good idea, TODO.
-SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}|?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
+SPLIT_PATTERN = r"""'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}{1,2}| ?[^\s\p{L}\p{N}]++[\r\n]*|\s*[\r\n]|\s+(?!\S)|\s+"""
 
-# ------------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 # Generic GPT-4-style tokenizer based on HuggingFace Tokenizer
 from tokenizers import Tokenizer as HFTokenizer
 from tokenizers import pre_tokenizers, decoders, Regex
@@ -50,18 +62,21 @@ class HuggingFaceTokenizer:
         # Configure the HuggingFace Tokenizer
         tokenizer = HFTokenizer(
             BPE(
-                byte_fallback=True,  # needed
+                byte_fallback=True,  # needed!
                 unk_token=None,
                 fuse_unk=False,
             )
         )
+        # Normalizer: None
         tokenizer.normalizer = None
         # Pre-tokenizer: GPT-4 style
-        # the regrex pattern used by GPT-4 to split text into groups before BPE
+        # the regex pattern used by GPT-4 to split text into groups before BPE
         # NOTE: The pattern was changed from \p{N}{1,3} to \p{N}{1,2} because I suspect it is harmful to
         # very small models and smaller vocab sizes, because it is a little bit wasteful in the token space.
         # (but I haven't validated this! TODO)
-        gpt4_split_regex = Regex(SPLIT_PATTERN)
+        gpt4_split_regex = Regex(
+            SPLIT_PATTERN
+        )  # huggingface demands that you wrap it in Regex!!
         tokenizer.pre_tokenizer = pre_tokenizers.Sequence(
             [
                 pre_tokenizers.Split(
@@ -72,11 +87,13 @@ class HuggingFaceTokenizer:
         )
         # Decoder: ByteLevel (it pairs together with the ByteLevel pre-tokenizer)
         tokenizer.decoder = decoders.ByteLevel()
+        # Post-processor: None
         tokenizer.post_processor = None
+        # Trainer: BPE
         trainer = BpeTrainer(
             vocab_size=vocab_size,
             show_progress=True,
-            min_frequency=0,
+            min_frequency=0,  # no minimum frequency
             initial_alphabet=pre_tokenizers.ByteLevel.alphabet(),
             special_tokens=SPECIAL_TOKENS,
         )
@@ -95,11 +112,9 @@ class HuggingFaceTokenizer:
     def id_to_token(self, id):
         return self.tokenizer.id_to_token(id)
 
-    def encode_special(self, text):
-        # encode a single special token via exact match
-        return self.tokenizer.token_to_id(text)
-
     def _encode_one(self, text, prepend=None, append=None):
+        # encode a single string
+        # prepend/append can be either a string of a special token or a token id directly.
         assert isinstance(text, str)
         ids = []
         if prepend is not None:
@@ -114,6 +129,10 @@ class HuggingFaceTokenizer:
             )
             ids.append(append_id)
         return ids
+
+    def encode_special(self, text):
+        # encode a single special token via exact match
+        return self.tokenizer.token_to_id(text)
 
     def get_bos_token_id(self):
         bos = self.encode_special("<|bos|>")
@@ -134,10 +153,11 @@ class HuggingFaceTokenizer:
         return self.tokenizer.decode(ids, skip_special_tokens=False)
 
     def save(self, tokenizer_dir):
+        # save the tokenizer to disk
         os.makedirs(tokenizer_dir, exist_ok=True)
         tokenizer_path = os.path.join(tokenizer_dir, "tokenizer.json")
         self.tokenizer.save(tokenizer_path)
-        print(f"Save tokenizer to {tokenizer_path}")
+        print(f"Saved tokenizer to {tokenizer_path}")
 
 
 # -----------------------------------------------------------------------------
@@ -158,7 +178,8 @@ class RustBPETokenizer:
     def train_from_iterator(cls, text_iterator, vocab_size):
         # 1) train using rustbpe
         tokenizer = rustbpe.Tokenizer()
-        vocab_size_no_special = vocab_size = len(SPECIAL_TOKENS)
+        # the special tokens are inserted later in __init__, we don't train them here
+        vocab_size_no_special = vocab_size - len(SPECIAL_TOKENS)
         assert (
             vocab_size_no_special >= 256
         ), f"vocab_size_no_special must be at least 256, got {vocab_size_no_special}"
@@ -174,10 +195,10 @@ class RustBPETokenizer:
             name: tokens_offset + i for i, name in enumerate(SPECIAL_TOKENS)
         }
         enc = tiktoken.Encoding(
-            name="rustbpt",
+            name="rustbpe",
             pat_str=pattern,
-            mergeable_ranks=mergeable_ranks,
-            special_tokens=special_tokens,
+            mergeable_ranks=mergeable_ranks,  # dict[bytes, int] (token bytes -> merge priority rank)
+            special_tokens=special_tokens,  # dict[str, int] (special token name -> token id)
         )
         return cls(enc, "<|bos|>")
 
@@ -186,7 +207,7 @@ class RustBPETokenizer:
         pickle_path = os.path.join(tokenizer_dir, "tokenizer.pkl")
         with open(pickle_path, "rb") as f:
             enc = pickle.load(f)
-        return cls(enc, "<|box|>")
+        return cls(enc, "<|bos|>")
 
     @classmethod
     def from_pretrained(cls, tiktoken_name):
@@ -201,7 +222,7 @@ class RustBPETokenizer:
     def get_vocab_size(self):
         return self.enc.n_vocab
 
-    def get_special_token(self):
+    def get_special_tokens(self):
         return self.enc.special_tokens_set
 
     def id_to_token(self, id):
@@ -215,6 +236,8 @@ class RustBPETokenizer:
         return self.bos_token_id
 
     def encode(self, text, prepend=None, append=None, num_threads=8):
+        # text can be either a string or a list of strings
+
         if prepend is not None:
             prepend_id = (
                 prepend if isinstance(prepend, int) else self.encode_special(prepend)
@@ -233,10 +256,10 @@ class RustBPETokenizer:
         elif isinstance(text, list):
             # Can we do the following?
             # ids = [self.encode(t, prepend, append) for t in text]
-            ids = self.enc.encond_ordinary_batch(text, num_threads=num_threads)
+            ids = self.enc.encode_ordinary_batch(text, num_threads=num_threads)
             if prepend is not None:
                 for ids_row in ids:
-                    ids_row.insert(0, prepend_id)
+                    ids_row.insert(0, prepend_id)  # TODO: same
             if append is not None:
                 for ids_row in ids:
                     ids_row.append(append_id)
@@ -252,11 +275,12 @@ class RustBPETokenizer:
         return self.enc.decode(ids)
 
     def save(self, tokenizer_dir):
+        # save the encoding object to disk
         os.makedirs(tokenizer_dir, exist_ok=True)
         pickle_path = os.path.join(tokenizer_dir, "tokenizer.pkl")
         with open(pickle_path, "wb") as f:
             pickle.dump(self.enc, f)
-        print(f"Save tokenizer encoding to {pickle_path}")
+        print(f"Saved tokenizer encoding to {pickle_path}")
 
     def render_conversation(self, conversation, max_tokens=2048):
         """
@@ -265,6 +289,7 @@ class RustBPETokenizer:
         - ids: list[int] is a list of token ids of this rendered conversation
         - mask: list[int] of same length, mask = 1 for tokens that the Assistant is expected to train on.
         """
+        # ids, masks that we will return and a helper function to help build them up.
         ids, mask = [], []
 
         def add_tokens(token_ids, mask_val):
@@ -275,7 +300,7 @@ class RustBPETokenizer:
 
         # sometimes the first message is a system message...
         # => just merge it with the second (user) message
-        if conversation["message"][0]["role"] == "system":
+        if conversation["messages"][0]["role"] == "system":
             # some conversation surgery is necessary here for now...
             conversation = copy.deepcopy(conversation)  # avoid mutating the original
             messages = conversation["messages"]
@@ -292,6 +317,9 @@ class RustBPETokenizer:
 
         # fetch all the special tokens we need
         bos = self.get_bos_token_id()
+        user_start, user_end = self.encode_special(
+            "<|user_start|>"
+        ), self.encode_special("<|user_end|>")
         assistant_start, assistant_end = self.encode_special(
             "<|assistant_start|>"
         ), self.encode_special("<|assistant_end|>")
@@ -305,56 +333,68 @@ class RustBPETokenizer:
         # now we can tokenize the conversation
         add_tokens(bos, 0)
         for i, message in enumerate(messages):
-            # some sanity check here aroudn assumptions, to prevent footguns
-            must_be_from = "user" if i % 2 == 0 else "assistent"
+
+            # some sanity checking here around assumptions, to prevent footguns
+            must_be_from = "user" if i % 2 == 0 else "assistant"
             assert (
                 message["role"] == must_be_from
             ), f"Message {i} is from {message['role']} but should be from {must_be_from}"
 
             # content can be either a simple string or a list of parts (e.g. containing tool calls)
             content = message["content"]
+
             if message["role"] == "user":
                 assert isinstance(
                     content, str
-                ), "user messages are simply expected to be strings"
-                add_tokens(self.encode(content, "<|user_start|>", "<|user_end|>"), 0)
+                ), "User messages are simply expected to be strings"
+                value_ids = self.encode(content)
+                add_tokens(user_start, 0)
+                add_tokens(value_ids, 0)
+                add_tokens(user_end, 0)
             elif message["role"] == "assistant":
                 add_tokens(assistant_start, 0)
                 if isinstance(content, str):
-                    add_tokens(self.encode(content), 1)
+                    # simple string => simply add the tokens
+                    value_ids = self.encode(content)
+                    add_tokens(value_ids, 1)
                 elif isinstance(content, list):
                     for part in content:
                         value_ids = self.encode(part["text"])
                         if part["type"] == "text":
+                            # string part => simply add the tokens
                             add_tokens(value_ids, 1)
                         elif part["type"] == "python":
+                            # python tool call => add the tokens inside <|python_start|> and <|python_end|>
                             add_tokens(python_start, 1)
                             add_tokens(value_ids, 1)
                             add_tokens(python_end, 1)
                         elif part["type"] == "python_output":
+                            # python output => add the tokens inside <|output_start|> and <|output_end|>
+                            # none of these tokens are supervised because the tokens come from Python at test time
                             add_tokens(output_start, 0)
                             add_tokens(value_ids, 0)
                             add_tokens(output_end, 0)
                         else:
-                            raise ValueError(f"Unknown part type {part['type']}")
+                            raise ValueError(f"Unknown part type: {part['type']}")
                 else:
                     raise ValueError(f"Unknown content type: {type(content)}")
                 add_tokens(assistant_end, 1)
 
-        # truncate to max_tokens
+        # truncate to max_tokens tokens MAX (helps prevent OOMs)
         ids = ids[:max_tokens]
         mask = mask[:max_tokens]
         return ids, mask
 
     def visualize_tokenization(self, ids, mask, with_token_id=False):
-        """Samll helper function useful in debugging: visualize the tokenization of render_conversation"""
+        """Small helper function useful in debugging: visualize the tokenization of render_conversation"""
         RED = "\033[91m"
         GREEN = "\033[92m"
         RESET = "\033[0m"
         GRAY = "\033[90m"
         tokens = []
         for i, (token_id, mask_val) in enumerate(zip(ids, mask)):
-            token_str = self.id_to_token(token_id)
+            # Can we do token_str = self.id_to_token(token_id)?
+            token_str = self.decode([token_id])
             color = GREEN if mask_val == 1 else RED
             tokens.append(f"{color}{token_str}{RESET}")
             if with_token_id:
@@ -367,14 +407,20 @@ class RustBPETokenizer:
         render the conversation priming the Assistant for a completion.
         Unlike the Chat SFT case, we don't need to return the mask.
         """
-        conversation = copy.deepcopy(conversation)
+        # We have some surgery to do: we need to pop the last message (of the Assistant)
+        conversation = copy.deepcopy(conversation)  # avoid mutating the original
+        messages = conversation["messages"]
         assert (
-            conversation["messages"][-1]["role"] == "assistant"
+            messages[-1]["role"] == "assistant"
         ), "Last message must be from the Assistant"
-        conversation["messages"].pop()
+        messages.pop()  # remove the last message (of the Assistant) inplace
 
-        ids, _ = self.render_conversatiion(conversation)
-        ids.append(self.encode_special("<|assistent_start|>"))
+        # Now tokenize the conversation
+        ids, mask = self.render_conversation(conversation)
+
+        # Finally, to prime the Assistant for a completion, append the Assistant start token
+        assistant_start = self.encode_special("<|assistant_start|>")
+        ids.append(assistant_start)
         return ids
 
 
