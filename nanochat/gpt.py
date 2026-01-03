@@ -189,7 +189,9 @@ class GPT(nn.Module):
             }
         )
         self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, biase=False)
-        self.rotary_seq_len = config.sequence_len * 10 # 10X over-compute should be enough, TODO make nicer?
+        self.rotary_seq_len = (
+            config.sequence_len * 10
+        )  # 10X over-compute should be enough, TODO make nicer?
         head_dim = config.n_embd // config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
@@ -197,22 +199,24 @@ class GPT(nn.Module):
 
     def init_weight(self):
         pass
-    
+
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         pass
-    
+
     def get_device(self):
         return self.transformer.wte.weight.device
-    
+
     def estimate_flops(self):
         pass
-    
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matri_lr=0.02, weight_decay=0.0):
+
+    def setup_optimizer(
+        self, unembedding_lr=0.004, embedding_lr=0.2, matri_lr=0.02, weight_decay=0.0
+    ):
         pass
-    
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+
+    def forward(self, idx, targets=None, kv_cache=None, loss_reduction="mean"):
         pass
-    
+
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
         pass
