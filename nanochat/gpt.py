@@ -12,10 +12,16 @@ Notable features:
 """
 
 import math
+from functools import partial
+from dataclasses import dataclass
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from nanochat.common import get_dist_info
+from nanochat.muon import Muon, DistMuon
+from nanochat.adamw import DistAdamW
 
 
 @dataclass
@@ -198,25 +204,156 @@ class GPT(nn.Module):
         self.register_buffer("sin", sin, persistent=False)
 
     def init_weight(self):
-        pass
+        """
+        Initialize the full model in this one function for maximum clarity.
+        """
+
+        # Embedding and unembedding
+        torch.nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=1.0)
+        torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
+
+        # Transformer blocks: uniform init with bound = sqrt(3) * std (same standard deviation as normal)
+        n_embd = self.config.n_embd
+        s = 3**0.5 * self.config.n_embd**-0.5
+        for block in self.transformer.h:
+            torch.nn.init.uniform_(block.attn.c_q.weight, -s, s)
+            torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
+            torch.nn.init.uniform_(block.attn.c_v.weight, -s, s)
+            torch.nn.init.zeros_(block.attn.c_proj.weight)
+            torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
+            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+
+        # Rotary embeddings
+        head_dim = self.config.n_embd // self.config.n_head
+        cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
+        self.cos, self.sin = cos, sin
+
+        # Cast token embeddings to bf16: optimizer can tolerate it and it saves memory
+        if self.transformer.wte.weight.device.type == "cuda":
+            self.transformer.wte.to(dtype=torch.bfloat16)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
-        pass
+        if device is None:
+            device = self.transformer.wte.weight.device
+
+        channel_range = torch.arange(0, head_dim, 2, dtype=torch.float32, device=device)
+        inv_freq = 1.0 / (base ** (channel_range / head_dim))
+        t = torch.arange(seq_len, dtype=torch.float32, device=device)
+        freqs = torch.outer(t, inv_freq)
+        cos, sin = freqs.cos(), freqs.sin()
+        cos, sin = cos.bfloat64(), sin.bfloat64()
+        cos, sin = cos[None, :, None, :], sin[None, :, None, :]
+        return cos, sin
 
     def get_device(self):
         return self.transformer.wte.weight.device
 
     def estimate_flops(self):
-        pass
+        """Return the estimated FLOPs per token for the model. Ref: https://arxiv.org/abs/2204.02311 (PaLM)"""
+        # TODO(jieruan): double check the 6N + 12LHQT derivation (including backward)
+        nparams = sum(p.numel() for p in self.parameters())
+        nparams_embedding = self.transformer.wte.weight.numel()
+        l, h, q, t = (
+            self.config.n_layer,
+            self.config.n_head,
+            self.config.n_embd // self.config.n_head,
+            self.config.sequence_len,
+        )
+        num_flops_per_token = 6 * (nparams - nparams_embedding) + 12 * l * h * q * t
+        return num_flops_per_token
 
+    # generally no needed, mainly when need different optimizers for different parameters group.
     def setup_optimizer(
-        self, unembedding_lr=0.004, embedding_lr=0.2, matri_lr=0.02, weight_decay=0.0
+        self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0
     ):
-        pass
+        model_dim = self.config.n_embd
+        ddp, rank, local_rank, world_size = get_dist_info()
+        matrix_params = list(self.transformer.h.parameters())
+        embedding_params = list(self.transformer.wte.parameters())
+        lm_head_params = list(self.lm_head.parameters())
+        assert len(list(self.parameters())) == len(matrix_params) + len(
+            embedding_params
+        ) + len(lm_head_params)
+        dmodel_lr_scale = (model_dim / 768) ** -0.5
+        print(
+            f"Scaling the LR for the AdamW parameters ∝1/√({model_dim}/768) = {dmodel_lr_scale:.6f}"
+        )
+        adam_groups = [
+            dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
+            dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
+        ]
+        adamw_kwargs = dict(betas=(0.8, 0.95), eps=1e-10, weight_decay=weight_decay)
+        AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
+        adamw_optimizer = AdamWFactory(adam_groups, **adamw_kwargs)
+        # Create the Muon optimizer for the linear layers
+        muon_kwargs = dict(lr=matrix_lr, momentum=0.95)
+        MuonFactory = DistMuon if ddp else Muon
+        muon_optimizer = MuonFactory(matrix_params, **muon_kwargs)
+        # Combine them the two optimizers into one list
+        optimizers = [adamw_optimizer, muon_optimizer]
+        for opt in optimizers:
+            for group in opt.param_groups:
+                group["initial_lr"] = group["lr"]
+        return optimizers
 
     def forward(self, idx, targets=None, kv_cache=None, loss_reduction="mean"):
-        pass
+        B, T = idx.size()
+
+        # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
+        assert T <= self.cos.size(1), f"Sequence lenght grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
+        assert idx.device == self.cos.device, f"Rotary embeddings and idx are on different devices: {idx.device} != {self.cos.device}"
+        assert self.cos.dtype == torch.bfloat16, f"Rotary embeddings must be in bfloat16"
+        T0 = 0 if kv_cache is None else kv_cache.get_pos()
+        cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T]
+
+        x = self.transformer.wte(idx)
+        x = norm(x)
+        for block in self.transformer.h:
+            x = block(x, cos_sin, kv_cache)
+        x = norm(x)
+
+        softcap = 15
+        logits = self.lm_head(x)
+        logits = logits[..., :self.config.vocab_size] # slice to remove padding
+        logits = logits.float() # switch to fp32 for logit softcap and loss computation
+        logits = softcap * torch.tanh(logits / softcap) # squash the logits, why?
+
+        if targets is not None:
+            # training: given the targets, compute and return the loss
+            # TODO experiment with chunked cross-entropy?
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reductiion=loss_reduction)
+            return loss
+        else:
+            # inference: just return the logits directly
+            return logits
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
-        pass
+        """
+        Naive autoregressive streaming inference.
+        To make it super simple, let's assume:
+        - batch size is 1
+        - ids and the yielded tokens are simple Python lists and ints
+        """
+        assert isinstance(tokens, list)
+        device = self.get_device()
+        rng = None
+        if temperature > 0:
+            rng = torch.Generator(device=device)
+            rng.manual_seed(seed)
+        ids = torch.tensor([tokens], dtype=torch.long, device=device)
+        for _ in range(max_tokens):
+            logits = self.forwward(ids) # (B, T, vocab_size)
+            logits = logits[:, -1, :]
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            if temperature > 0:
+                logits = logits / temperature
+                probs = F.softmax(logits, dim=-1)
+                next_ids = torch.multinomial(probs, num_samples=1, generator=rng)
+            else:
+                next_ids = torch.argmax(logits, dim=-1, keepdim=True)
+            ids = torch.cat((ids, next_ids), dim=1)
+            token = next_ids.item()
+            yield token
