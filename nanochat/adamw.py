@@ -56,6 +56,10 @@ class DistAdamW(torch.optim.Optimizer):
             wd = group["weight_decay"]
             params = group["params"]
             for base in range(len(params)):
+                # Why Wait: The CPU must verify the network data has arrived before it can tell the GPU to compute the optimizer update. Pure async chaining of complex Python optimizer logic is not currently supported by the standard Distributed API.
+                # This is the key design constraint of PyTorch's eager execution model.
+                # Reason A: Data Dependency (The GPU needs the data) The Adam step is a mathematical operation: param = param - lr * grad. You cannot perform this subtraction until grad actually exists in memory.
+                # Reason B: CPU vs. GPU Asynchrony PyTorch is already async. When you write c = a + b in Python, the CPU queues the kernel and moves on immediately—it doesn't wait for the GPU to finish.
                 reduce_scatter_futures[idx].wait()
                 p = params[base]
                 rank_size = p.shape[0] // world_size
